@@ -19,7 +19,7 @@ import yfinance as yf
 
 st.set_page_config(page_title="AI Stock Screener (Educational)", layout="centered")
 
-GEMINI_MODEL = "gemini-2.0-flash"  # check ai.google.dev for current free-tier model names
+GEMINI_MODEL = "gemini-2.5-flash"  # check ai.google.dev for current free-tier model names
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 
