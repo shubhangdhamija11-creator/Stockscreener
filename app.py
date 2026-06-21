@@ -70,11 +70,25 @@ QUICK_PICKS = ["RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "SBIN", "ITC"
 
 # ---------- Sidebar ----------
 st.sidebar.header("⚙️ Setup")
-api_key = os.environ.get("GEMINI_API_KEY") or st.sidebar.text_input(
-    "Gemini API key (free, no card — get one at aistudio.google.com)",
-    type="password",
-)
-st.sidebar.caption("Your key stays in this session only, never saved or shared.")
+
+
+def _secret_key():
+    try:
+        return st.secrets.get("GEMINI_API_KEY", "")
+    except Exception:
+        return ""
+
+
+api_key = os.environ.get("GEMINI_API_KEY") or _secret_key()
+if api_key:
+    st.sidebar.success("✅ AI summaries are enabled — nothing to set up!")
+else:
+    api_key = st.sidebar.text_input(
+        "Gemini API key (free, no card — get one at aistudio.google.com)",
+        type="password",
+    )
+    st.sidebar.caption("Your key stays in this session only, never saved or shared.")
+
 st.sidebar.divider()
 st.sidebar.caption("Educational, rule-based tool. Not financial advice.")
 
@@ -408,4 +422,4 @@ st.divider()
 st.caption(
     "⚠️ Educational tool only. Not financial advice. Technical indicators are "
     "simplified heuristics and do not account for news, risk, or macro conditions."
-            )
+)
