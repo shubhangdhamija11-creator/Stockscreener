@@ -16,6 +16,12 @@ import requests
 import pandas as pd
 import streamlit as st
 import yfinance as yf
+import plotly.graph_objects as go
+
+# Brand palette -- keep in sync with .streamlit/config.toml
+GREEN = "#22C55E"
+AMBER = "#FBBF24"
+RED = "#EF4444"
 
 st.set_page_config(page_title="AI Stock Screener", page_icon="📊", layout="centered")
 
@@ -232,6 +238,57 @@ def compute_signal(ind: dict):
     return signal, score, breakdown
 
 
+def make_price_chart(df: pd.DataFrame) -> go.Figure:
+    close = df["Close"]
+    sma50 = close.rolling(50).mean()
+    sma200 = close.rolling(200).mean()
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df.index, y=close, name="Price",
+                              line=dict(color=GREEN, width=2)))
+    fig.add_trace(go.Scatter(x=df.index, y=sma50, name="50-day avg",
+                              line=dict(color=AMBER, width=1.5, dash="dot")))
+    fig.add_trace(go.Scatter(x=df.index, y=sma200, name="200-day avg",
+                              line=dict(color=RED, width=1.5, dash="dot")))
+    fig.update_layout(
+        height=280,
+        margin=dict(l=10, r=10, t=10, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        xaxis=dict(showgrid=False),
+        yaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.1)"),
+        hovermode="x unified",
+        font=dict(color="#E5E7EB"),
+    )
+    return fig
+
+
+def make_gauge(score: int) -> go.Figure:
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=score,
+        number={"font": {"size": 34}},
+        gauge={
+            "axis": {"range": [-4, 4], "tickwidth": 1},
+            "bar": {"color": "#E5E7EB", "thickness": 0.25},
+            "bgcolor": "rgba(0,0,0,0)",
+            "steps": [
+                {"range": [-4, -2], "color": RED},
+                {"range": [-2, 2], "color": AMBER},
+                {"range": [2, 4], "color": GREEN},
+            ],
+        },
+    ))
+    fig.update_layout(
+        height=170,
+        margin=dict(l=20, r=20, t=10, b=10),
+        paper_bgcolor="rgba(0,0,0,0)",
+        font={"color": "#E5E7EB"},
+    )
+    return fig
+
+
 def scan_stocks(symbols):
     """Rule-based only -- no AI calls -- so it stays fast and free even for many stocks."""
     results, errors = [], []
@@ -346,7 +403,7 @@ with tab1:
                         st.error(f"🔴 **SELL** — signal score {score} / 4")
                     else:
                         st.warning(f"🟡 **HOLD** — signal score {score} / 4")
-                    st.progress((score + 4) / 8)
+                    st.plotly_chart(make_gauge(score), use_container_width=True, config={"displayModeBar": False})
 
                     col1, col2 = st.columns(2)
                     with col1:
@@ -356,7 +413,7 @@ with tab1:
                         st.metric("MACD", indicators["macd"])
                         st.metric("Signal Line", indicators["macd_signal"])
 
-                    st.line_chart(df["Close"], height=200)
+                    st.plotly_chart(make_price_chart(df), use_container_width=True, config={"displayModeBar": False})
 
                 with st.expander("📐 Why this rating? — see the basis for the score"):
                     st.dataframe(
@@ -381,6 +438,19 @@ with tab1:
             except Exception as e:
                 st.error(f"Something went wrong while analyzing this stock: {e}")
                 st.caption("This is usually temporary — try again in a minute.")
+    else:
+        st.divider()
+        st.markdown("#### 👋 Get started in 3 taps")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown("**1️⃣ Pick**")
+            st.caption("Tap a quick pick or search any NSE/BSE stock")
+        with c2:
+            st.markdown("**2️⃣ Analyze**")
+            st.caption("See RSI, MACD, trend score & fundamentals")
+        with c3:
+            st.markdown("**3️⃣ Understand**")
+            st.caption("Read the plain-English AI takeaway")
 
 # ===== TAB 2: bulk bullish/bearish screener =====
 with tab2:
@@ -401,19 +471,29 @@ with tab2:
     if st.button("Scan list 🔎", use_container_width=True) and chosen:
         results, errors = scan_stocks(chosen)
         if results:
-            df_results = pd.DataFrame(results)
-            bullish = df_results[df_results["Signal"] == "BUY"].sort_values("Score", ascending=False)
-            neutral = df_results[df_results["Signal"] == "HOLD"]
-            bearish = df_results[df_results["Signal"] == "SELL"].sort_values("Score")
+            df_results = pd.DataFrame(results).sort_values("Score", ascending=False).reset_index(drop=True)
 
-            st.success(f"🟢 Bullish — {len(bullish)} stock(s)")
-            st.dataframe(bullish[["Symbol", "Name", "Price", "Score"]], hide_index=True, use_container_width=True)
+            n_bull = (df_results["Signal"] == "BUY").sum()
+            n_hold = (df_results["Signal"] == "HOLD").sum()
+            n_bear = (df_results["Signal"] == "SELL").sum()
+            m1, m2, m3 = st.columns(3)
+            m1.metric("🟢 Bullish", n_bull)
+            m2.metric("🟡 Neutral", n_hold)
+            m3.metric("🔴 Bearish", n_bear)
 
-            st.warning(f"🟡 Neutral / Hold — {len(neutral)} stock(s)")
-            st.dataframe(neutral[["Symbol", "Name", "Price", "Score"]], hide_index=True, use_container_width=True)
+            display_df = df_results[["Symbol", "Name", "Price", "Score", "Signal"]]
+            try:
+                styled = (
+                    display_df.style
+                    .background_gradient(subset=["Score"], cmap="RdYlGn", vmin=-4, vmax=4)
+                    .format({"Price": "₹{:.2f}"})
+                )
+                st.dataframe(styled, hide_index=True, use_container_width=True)
+            except Exception:
+                # Fallback if styling isn't supported in this environment
+                st.dataframe(display_df, hide_index=True, use_container_width=True)
 
-            st.error(f"🔴 Bearish — {len(bearish)} stock(s)")
-            st.dataframe(bearish[["Symbol", "Name", "Price", "Score"]], hide_index=True, use_container_width=True)
+            st.caption("Sorted most bullish → most bearish. Green = higher score, red = lower score.")
 
         if errors:
             st.caption(f"Couldn't fetch data for: {', '.join(errors)}")
@@ -423,3 +503,4 @@ st.caption(
     "⚠️ Educational tool only. Not financial advice. Technical indicators are "
     "simplified heuristics and do not account for news, risk, or macro conditions."
 )
+st.caption("📊 AI Stock Screener · built with Streamlit, yfinance & Gemini")
