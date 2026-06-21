@@ -11,6 +11,7 @@ EDUCATIONAL USE ONLY -- NOT FINANCIAL ADVICE.
 
 import re
 import os
+import time
 import requests
 import pandas as pd
 import streamlit as st
@@ -79,20 +80,35 @@ st.sidebar.caption("Educational, rule-based tool. Not financial advice.")
 
 
 # ---------- Data fetching ----------
-@st.cache_data(ttl=900)
+@st.cache_data(ttl=1800)
 def fetch_price_history(ticker: str) -> pd.DataFrame:
-    return yf.Ticker(ticker).history(period="1y")
+    """Retries briefly, then gives up quietly instead of crashing the app."""
+    for attempt in range(2):
+        try:
+            df = yf.Ticker(ticker).history(period="1y")
+            if not df.empty:
+                return df
+        except Exception:
+            pass
+        time.sleep(2)
+    return pd.DataFrame()
 
 
-@st.cache_data(ttl=900)
+@st.cache_data(ttl=1800)
 def fetch_fundamentals(ticker: str) -> dict:
-    info = yf.Ticker(ticker).info or {}
     keys = [
         "longName", "currentPrice", "trailingPE", "forwardPE",
         "priceToBook", "returnOnEquity", "debtToEquity",
         "dividendYield", "marketCap", "fiftyTwoWeekHigh", "fiftyTwoWeekLow",
     ]
-    return {k: info.get(k) for k in keys}
+    for attempt in range(2):
+        try:
+            info = yf.Ticker(ticker).info or {}
+            return {k: info.get(k) for k in keys}
+        except Exception:
+            pass
+        time.sleep(2)
+    return {}
 
 
 def resolve_ticker(raw: str):
@@ -212,7 +228,9 @@ def scan_stocks(symbols):
         resolved, df = resolve_ticker(sym)
         if df.empty:
             errors.append(sym)
+            time.sleep(0.5)
             continue
+        time.sleep(0.5)
         indicators = compute_indicators(df)
         signal, score, _ = compute_signal(indicators)
         results.append({
@@ -295,49 +313,60 @@ with tab1:
             symbol, df = resolve_ticker(raw_input)
 
         if df.empty:
-            st.error("Couldn't find data for that symbol. Try the exact NSE/BSE ticker.")
+            st.error(
+                "Couldn't fetch data right now. Either the symbol is wrong, or the data "
+                "provider is briefly rate-limiting this shared server — wait a minute or "
+                "two and try again."
+            )
         else:
-            fundamentals = fetch_fundamentals(symbol)
-            indicators = compute_indicators(df)
-            signal, score, breakdown = compute_signal(indicators)
+            try:
+                fundamentals = fetch_fundamentals(symbol)
+                indicators = compute_indicators(df)
+                signal, score, breakdown = compute_signal(indicators)
 
-            with st.container(border=True):
-                st.subheader(f"{fundamentals.get('longName', symbol)} ({symbol})")
-                if signal == "BUY":
-                    st.success(f"🟢 **BUY** — signal score {score} / 4")
-                elif signal == "SELL":
-                    st.error(f"🔴 **SELL** — signal score {score} / 4")
+                with st.container(border=True):
+                    st.subheader(f"{fundamentals.get('longName', symbol)} ({symbol})")
+                    if signal == "BUY":
+                        st.success(f"🟢 **BUY** — signal score {score} / 4")
+                    elif signal == "SELL":
+                        st.error(f"🔴 **SELL** — signal score {score} / 4")
+                    else:
+                        st.warning(f"🟡 **HOLD** — signal score {score} / 4")
+                    st.progress((score + 4) / 8)
+
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("Price", f"₹{indicators['price']}")
+                        st.metric("RSI (14)", indicators["rsi"])
+                    with col2:
+                        st.metric("MACD", indicators["macd"])
+                        st.metric("Signal Line", indicators["macd_signal"])
+
+                    st.line_chart(df["Close"], height=200)
+
+                with st.expander("📐 Why this rating? — see the basis for the score"):
+                    st.dataframe(
+                        pd.DataFrame(breakdown, columns=["Indicator", "Value", "Signal", "Why"]),
+                        hide_index=True, use_container_width=True,
+                    )
+                    st.caption("Score ranges -4 (all bearish) to +4 (all bullish). ≥2 → BUY, ≤-2 → SELL, else → HOLD.")
+
+                with st.expander("💰 Fundamentals"):
+                    if fundamentals:
+                        st.dataframe(format_fundamentals(fundamentals), hide_index=True, use_container_width=True)
+                    else:
+                        st.caption("Fundamentals temporarily unavailable (data provider rate limit). Price chart and technical score above are unaffected.")
+
+                st.subheader("🤖 AI Summary")
+                if api_key:
+                    with st.spinner("Generating AI narrative..."):
+                        narrative = generate_narrative(symbol, fundamentals, breakdown, signal, api_key)
+                    st.write(narrative)
                 else:
-                    st.warning(f"🟡 **HOLD** — signal score {score} / 4")
-                st.progress((score + 4) / 8)
-
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.metric("Price", f"₹{indicators['price']}")
-                    st.metric("RSI (14)", indicators["rsi"])
-                with col2:
-                    st.metric("MACD", indicators["macd"])
-                    st.metric("Signal Line", indicators["macd_signal"])
-
-                st.line_chart(df["Close"], height=200)
-
-            with st.expander("📐 Why this rating? — see the basis for the score"):
-                st.dataframe(
-                    pd.DataFrame(breakdown, columns=["Indicator", "Value", "Signal", "Why"]),
-                    hide_index=True, use_container_width=True,
-                )
-                st.caption("Score ranges -4 (all bearish) to +4 (all bullish). ≥2 → BUY, ≤-2 → SELL, else → HOLD.")
-
-            with st.expander("💰 Fundamentals"):
-                st.dataframe(format_fundamentals(fundamentals), hide_index=True, use_container_width=True)
-
-            st.subheader("🤖 AI Summary")
-            if api_key:
-                with st.spinner("Generating AI narrative..."):
-                    narrative = generate_narrative(symbol, fundamentals, breakdown, signal, api_key)
-                st.write(narrative)
-            else:
-                st.info("Enter a free Gemini API key in the sidebar to get an AI-written summary.")
+                    st.info("Enter a free Gemini API key in the sidebar to get an AI-written summary.")
+            except Exception as e:
+                st.error(f"Something went wrong while analyzing this stock: {e}")
+                st.caption("This is usually temporary — try again in a minute.")
 
 # ===== TAB 2: bulk bullish/bearish screener =====
 with tab2:
@@ -379,4 +408,4 @@ st.divider()
 st.caption(
     "⚠️ Educational tool only. Not financial advice. Technical indicators are "
     "simplified heuristics and do not account for news, risk, or macro conditions."
-)
+            )
