@@ -17,6 +17,7 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # Brand palette -- keep in sync with .streamlit/config.toml
 GREEN = "#22C55E"
@@ -274,24 +275,56 @@ def make_price_chart(df: pd.DataFrame) -> go.Figure:
     sma50 = close.rolling(50).mean()
     sma200 = close.rolling(200).mean()
 
-    fig = go.Figure()
+    bb_mid = close.rolling(20).mean()
+    bb_std = close.rolling(20).std()
+    bb_upper = bb_mid + 2 * bb_std
+    bb_lower = bb_mid - 2 * bb_std
+
+    week52_high = df["High"].max()
+    week52_low = df["Low"].min()
+    vol_colors = [GREEN if c >= o else RED for o, c in zip(df["Open"], df["Close"])]
+
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True,
+        row_heights=[0.72, 0.28], vertical_spacing=0.04,
+    )
+
+    # Bollinger Band shading (upper trace invisible, lower trace fills back up to it)
+    fig.add_trace(go.Scatter(x=df.index, y=bb_upper, line=dict(width=0),
+                              showlegend=False, hoverinfo="skip"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=bb_lower, line=dict(width=0), fill="tonexty",
+                              fillcolor="rgba(99,102,241,0.15)", name="Bollinger Band (20,2)",
+                              hoverinfo="skip"), row=1, col=1)
+
     fig.add_trace(go.Scatter(x=df.index, y=close, name="Price",
-                              line=dict(color=GREEN, width=2)))
+                              line=dict(color=GREEN, width=2)), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=sma50, name="50-day avg",
-                              line=dict(color=AMBER, width=1.5, dash="dot")))
+                              line=dict(color=AMBER, width=1.3, dash="dot")), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=sma200, name="200-day avg",
-                              line=dict(color=RED, width=1.5, dash="dot")))
+                              line=dict(color=RED, width=1.3, dash="dot")), row=1, col=1)
+
+    fig.add_hline(y=week52_high, line=dict(color="rgba(229,231,235,0.4)", dash="dash", width=1),
+                  annotation_text="52w High", annotation_font_size=10,
+                  annotation_position="top left", row=1, col=1)
+    fig.add_hline(y=week52_low, line=dict(color="rgba(229,231,235,0.4)", dash="dash", width=1),
+                  annotation_text="52w Low", annotation_font_size=10,
+                  annotation_position="bottom left", row=1, col=1)
+
+    fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Volume",
+                          marker_color=vol_colors, showlegend=False), row=2, col=1)
+
     fig.update_layout(
-        height=280,
+        height=420,
         margin=dict(l=10, r=10, t=10, b=10),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        xaxis=dict(showgrid=False),
-        yaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.1)"),
         hovermode="x unified",
         font=dict(color="#E5E7EB"),
     )
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(showgrid=True, gridcolor="rgba(255,255,255,0.1)", row=1, col=1)
+    fig.update_yaxes(showgrid=False, title_text="Volume", title_font_size=10, row=2, col=1)
     return fig
 
 
@@ -440,11 +473,17 @@ with tab1:
                     with col1:
                         st.metric("Price", f"₹{indicators['price']}")
                         st.metric("RSI (14)", indicators["rsi"])
+                        st.caption("🟢 <30 buy zone · ⚪ 30–70 neutral · 🔴 >70 sell zone")
                     with col2:
                         st.metric("MACD", indicators["macd"])
                         st.metric("Signal Line", indicators["macd_signal"])
+                        st.caption("🟢 MACD above Signal = bullish · 🔴 MACD below Signal = bearish")
 
                     st.plotly_chart(make_price_chart(df), use_container_width=True, config={"displayModeBar": False})
+                    st.caption(
+                        "🟣 Shaded band = Bollinger Bands (volatility) · dashed lines = 52-week high/low · "
+                        "bottom bars = daily volume (green = up day, red = down day)"
+                    )
 
                 with st.expander("📐 Why this rating? — see the basis for the score"):
                     st.dataframe(
