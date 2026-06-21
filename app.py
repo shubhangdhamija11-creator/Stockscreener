@@ -13,6 +13,7 @@ import re
 import os
 import time
 import requests
+import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
@@ -154,6 +155,21 @@ def fetch_fundamentals(ticker: str) -> dict:
     return {}
 
 
+@st.cache_data(ttl=3600)
+def fetch_extended_history(ticker: str, period: str = "5y") -> pd.DataFrame:
+    """Only called when the user opts into weekly/monthly view or a backtest --
+    keeps the default single-stock flow from making extra requests."""
+    for attempt in range(2):
+        try:
+            df = yf.Ticker(ticker).history(period=period)
+            if not df.empty:
+                return df
+        except Exception:
+            pass
+        time.sleep(2)
+    return pd.DataFrame()
+
+
 def resolve_ticker(raw: str):
     raw = raw.strip().upper().replace(".NS", "").replace(".BO", "")
     for suffix in [".NS", ".BO"]:
@@ -270,7 +286,116 @@ def compute_signal(ind: dict):
     return signal, score, breakdown
 
 
-def make_price_chart(df: pd.DataFrame) -> go.Figure:
+def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
+    return df.resample(rule).agg(agg).dropna()
+
+
+def multi_timeframe_view(daily_df: pd.DataFrame, extended_df: pd.DataFrame) -> pd.DataFrame:
+    """Daily uses the regular 1y data; Weekly/Monthly need the longer history
+    so 50/200-period moving averages have enough bars to mean something."""
+    weekly_df = resample_ohlc(extended_df, "W")
+    monthly_df = resample_ohlc(extended_df, "ME")
+
+    rows = []
+    for label, tf_df, min_bars in [("Daily", daily_df, 60), ("Weekly", weekly_df, 60), ("Monthly", monthly_df, 24)]:
+        if tf_df is None or len(tf_df) < min_bars:
+            rows.append({"Timeframe": label, "Signal": "Not enough history", "Score": "—", "RSI": "—", "Price": "—"})
+            continue
+        ind = compute_indicators(tf_df)
+        sig, score, _ = compute_signal(ind)
+        rows.append({"Timeframe": label, "Signal": sig, "Score": score, "RSI": ind["rsi"], "Price": f"₹{ind['price']}"})
+    return pd.DataFrame(rows)
+
+
+def compute_score_series(df: pd.DataFrame):
+    """Vectorized version of compute_signal -- same rules, applied to every row
+    at once so we can backtest instead of just reading the latest value."""
+    close = df["Close"]
+    rsi = compute_rsi(close)
+    macd_line, signal_line = compute_macd(close)
+    sma50 = close.rolling(50).mean()
+    sma200 = close.rolling(200).mean()
+
+    rsi_pts = np.select([rsi < 30, rsi > 70], [1, -1], default=0)
+    rsi_pts = np.where(rsi.isna(), 0, rsi_pts)
+
+    macd_pts = np.where(macd_line > signal_line, 1, -1)
+    macd_pts = np.where(macd_line.isna() | signal_line.isna(), 0, macd_pts)
+
+    sma50_pts = np.where(close > sma50, 1, -1)
+    sma50_pts = np.where(sma50.isna(), 0, sma50_pts)
+
+    sma200_pts = np.where(close > sma200, 1, -1)
+    sma200_pts = np.where(sma200.isna(), 0, sma200_pts)
+
+    score = pd.Series(rsi_pts + macd_pts + sma50_pts + sma200_pts, index=df.index)
+    signal = pd.Series(np.select([score >= 2, score <= -2], ["BUY", "SELL"], default="HOLD"), index=df.index)
+    return score, signal
+
+
+def run_backtest(df: pd.DataFrame, holding_days=(5, 20, 60)):
+    """Long-only: act on YESTERDAY's signal (no lookahead bias). No transaction
+    costs, slippage, or taxes are modeled -- this is for learning, not trading."""
+    df = df.copy()
+    score, signal = compute_score_series(df)
+
+    warmup = 200  # first 200 rows can't have a valid 200-period average yet
+    if len(df) <= warmup + max(holding_days):
+        return None, None, None
+
+    close = df["Close"]
+    daily_return = close.pct_change()
+
+    acted_signal = signal.shift(1)  # yesterday's signal drives today's action
+    strategy_return = daily_return.where(acted_signal == "BUY", 0.0)
+
+    bt = pd.DataFrame({"Signal": signal, "DailyReturn": daily_return}, index=df.index).iloc[warmup:]
+    for h in holding_days:
+        bt[f"fwd_{h}d"] = close.shift(-h) / close - 1
+
+    # One row per signal type, with avg forward return + win rate for each holding period
+    table_rows = []
+    for sig in ["BUY", "HOLD", "SELL"]:
+        subset = bt[bt["Signal"] == sig]
+        table_rows.append({"Signal": sig, "Occurrences": len(subset)})
+    summary_df = pd.DataFrame(table_rows)
+    for h, label in zip(holding_days, ["~1 week", "~1 month", "~3 months"]):
+        avg_returns, win_rates = [], []
+        for sig in ["BUY", "HOLD", "SELL"]:
+            valid = bt[bt["Signal"] == sig][f"fwd_{h}d"].dropna()
+            avg_returns.append(round(valid.mean() * 100, 2) if len(valid) else None)
+            win_rates.append(round((valid > 0).mean() * 100, 1) if len(valid) else None)
+        summary_df[f"Avg return ({label})"] = avg_returns
+        summary_df[f"Win rate % ({label})"] = win_rates
+
+    # Equity curves, both rebased to 1.0 at the start of the tested window
+    strat_window = strategy_return.iloc[warmup:].fillna(0)
+    hold_window = daily_return.iloc[warmup:].fillna(0)
+    cum_strategy = (1 + strat_window).cumprod()
+    cum_buyhold = (1 + hold_window).cumprod()
+
+    return summary_df, cum_strategy, cum_buyhold
+
+
+def make_backtest_chart(cum_strategy: pd.Series, cum_buyhold: pd.Series) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=cum_strategy.index, y=cum_strategy, name="Signal strategy (long only on BUY)",
+                              line=dict(color=GREEN, width=2)))
+    fig.add_trace(go.Scatter(x=cum_buyhold.index, y=cum_buyhold, name="Just buy & hold",
+                              line=dict(color="#9CA3AF", width=2, dash="dot")))
+    fig.update_layout(
+        height=280,
+        margin=dict(l=10, r=10, t=10, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        xaxis=dict(showgrid=False),
+        yaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.1)", title="Growth of ₹1"),
+        hovermode="x unified",
+        font=dict(color="#E5E7EB"),
+    )
+    return fig
     close = df["Close"]
     sma50 = close.rolling(50).mean()
     sma200 = close.rolling(200).mean()
@@ -412,7 +537,7 @@ Keep it under 200 words.
 st.title("📊 AI Stock Screener")
 st.caption("Educational trial · NSE/BSE · RSI + MACD + Moving Averages + Gemini summary")
 
-tab1, tab2 = st.tabs(["🔍 Analyze a Stock", "📋 Screen a List"])
+tab1, tab2, tab3 = st.tabs(["🔍 Analyze a Stock", "📋 Screen a List", "🧪 Backtest"])
 
 # ===== TAB 1: single-stock deep dive =====
 with tab1:
@@ -498,6 +623,24 @@ with tab1:
                     else:
                         st.caption("Fundamentals temporarily unavailable (data provider rate limit). Price chart and technical score above are unaffected.")
 
+                with st.expander("📅 Daily vs Weekly vs Monthly view"):
+                    st.caption(
+                        "Same scoring rules, applied to weekly and monthly candles instead of daily. "
+                        "Fetches a bit more history the first time (~5 years), then it's cached."
+                    )
+                    if st.button("Load weekly/monthly view", key="load_mtf"):
+                        with st.spinner("Fetching extended history..."):
+                            ext_df = fetch_extended_history(symbol)
+                        if ext_df.empty:
+                            st.error("Couldn't fetch extended history right now — try again shortly.")
+                        else:
+                            mtf = multi_timeframe_view(df, ext_df)
+                            st.dataframe(mtf, hide_index=True, use_container_width=True)
+                            st.caption(
+                                "Short-term (Daily) and long-term (Monthly) signals can disagree — that's normal. "
+                                "A stock can look weak short-term while still being fine for a long-term hold, or vice versa."
+                            )
+
                 st.subheader("🤖 AI Summary")
                 if api_key:
                     with st.spinner("Generating AI narrative..."):
@@ -567,6 +710,74 @@ with tab2:
 
         if errors:
             st.caption(f"Couldn't fetch data for: {', '.join(errors)}")
+
+# ===== TAB 3: backtest the scoring rule against history =====
+with tab3:
+    st.subheader("🧪 Backtest the signal")
+    st.caption(
+        "Runs the exact same RSI + MACD + moving-average score against ~5 years of "
+        "history and checks what actually happened afterward. This is the honest way "
+        "to see how reliable the signal really is, instead of just trusting it."
+    )
+    st.warning(
+        "⚠️ No transaction costs, taxes, or slippage are modeled. Past performance on "
+        "historical data does NOT guarantee future results. This is for learning how "
+        "backtesting works, not a trading system.",
+        icon="⚠️",
+    )
+
+    bt_options = [f"{name} ({sym})" for sym, name in sorted(NSE_STOCKS.items(), key=lambda x: x[1])]
+    bt_selected = st.selectbox(
+        "Pick a stock to backtest",
+        options=["— Select a stock —"] + bt_options,
+        index=0,
+        key="bt_select",
+    )
+    bt_custom = st.text_input("Or enter a custom NSE/BSE symbol", key="bt_custom")
+    run_bt = st.button("Run backtest 🧪", type="primary", use_container_width=True)
+
+    if run_bt:
+        bt_raw = None
+        if bt_custom.strip():
+            bt_raw = bt_custom.strip()
+        elif bt_selected != "— Select a stock —":
+            match = re.search(r"\(([^)]+)\)$", bt_selected)
+            bt_raw = match.group(1) if match else None
+
+        if not bt_raw:
+            st.error("Pick a stock or enter a symbol first.")
+        else:
+            with st.spinner("Fetching ~5 years of history and running the backtest..."):
+                bt_symbol, _ = resolve_ticker(bt_raw)
+                ext_df = fetch_extended_history(bt_symbol) if bt_symbol else pd.DataFrame()
+
+            if ext_df.empty:
+                st.error("Couldn't fetch enough history for this symbol right now — try again shortly.")
+            else:
+                summary_df, cum_strategy, cum_buyhold = run_backtest(ext_df)
+                if summary_df is None:
+                    st.error("Not enough history available for a meaningful backtest on this stock.")
+                else:
+                    st.markdown(f"#### Results for {bt_symbol}")
+                    st.dataframe(summary_df, hide_index=True, use_container_width=True)
+                    st.caption(
+                        "'Occurrences' = how many days in the backtest had that signal. "
+                        "'Avg return' = average price change over the holding period after that signal. "
+                        "'Win rate' = % of the time the return was positive."
+                    )
+
+                    total_strategy_return = (cum_strategy.iloc[-1] - 1) * 100
+                    total_buyhold_return = (cum_buyhold.iloc[-1] - 1) * 100
+                    c1, c2 = st.columns(2)
+                    c1.metric("Strategy total return", f"{total_strategy_return:.1f}%")
+                    c2.metric("Buy & hold total return", f"{total_buyhold_return:.1f}%")
+
+                    st.plotly_chart(make_backtest_chart(cum_strategy, cum_buyhold),
+                                     use_container_width=True, config={"displayModeBar": False})
+                    st.caption(
+                        "Strategy = only invested on days after a BUY signal, in cash otherwise. "
+                        "Compare it to simply buying and holding the whole time."
+                    )
 
 st.divider()
 st.caption(
