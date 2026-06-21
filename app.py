@@ -98,6 +98,28 @@ else:
 st.sidebar.divider()
 st.sidebar.caption("Educational, rule-based tool. Not financial advice.")
 
+with st.sidebar.expander("📖 Indicator cheat sheet"):
+    st.markdown(
+        """
+**RSI (14)** — range 0 to 100
+- Below 30 → oversold, often a buy signal
+- 30–70 → neutral, no strong signal
+- Above 70 → overbought, often a sell signal
+
+**MACD vs Signal line** — no fixed range
+- MACD above Signal → bullish momentum
+- MACD below Signal → bearish momentum
+
+**Price vs 50-day average** — short-term trend (~2–3 months)
+- Price above it → uptrend
+- Price below it → downtrend
+
+**Price vs 200-day average** — long-term trend (~1 year)
+- Price above it → uptrend
+- Price below it → downtrend
+        """
+    )
+
 
 # ---------- Data fetching ----------
 @st.cache_data(ttl=1800)
@@ -199,35 +221,44 @@ def compute_signal(ind: dict):
     if ind["rsi"] is not None:
         if ind["rsi"] < 30:
             score += 1
-            breakdown.append(("RSI (14)", ind["rsi"], "🟢 Bullish", "Below 30 — may be oversold"))
+            breakdown.append(("RSI (14)", ind["rsi"], "🟢 Bullish", "Below 30 — may be oversold",
+                               "0–100  ·  <30 buy zone  ·  30–70 neutral  ·  >70 sell zone"))
         elif ind["rsi"] > 70:
             score -= 1
-            breakdown.append(("RSI (14)", ind["rsi"], "🔴 Bearish", "Above 70 — may be overbought"))
+            breakdown.append(("RSI (14)", ind["rsi"], "🔴 Bearish", "Above 70 — may be overbought",
+                               "0–100  ·  <30 buy zone  ·  30–70 neutral  ·  >70 sell zone"))
         else:
-            breakdown.append(("RSI (14)", ind["rsi"], "⚪ Neutral", "Between 30-70 — no extreme"))
+            breakdown.append(("RSI (14)", ind["rsi"], "⚪ Neutral", "Between 30-70 — no extreme",
+                               "0–100  ·  <30 buy zone  ·  30–70 neutral  ·  >70 sell zone"))
 
     if ind["macd"] > ind["macd_signal"]:
         score += 1
-        breakdown.append(("MACD", f"{ind['macd']} vs {ind['macd_signal']}", "🟢 Bullish", "MACD above signal — upward momentum"))
+        breakdown.append(("MACD", f"{ind['macd']} vs {ind['macd_signal']}", "🟢 Bullish", "MACD above signal — upward momentum",
+                           "No fixed range  ·  MACD > Signal is bullish  ·  MACD < Signal is bearish"))
     else:
         score -= 1
-        breakdown.append(("MACD", f"{ind['macd']} vs {ind['macd_signal']}", "🔴 Bearish", "MACD below signal — downward momentum"))
+        breakdown.append(("MACD", f"{ind['macd']} vs {ind['macd_signal']}", "🔴 Bearish", "MACD below signal — downward momentum",
+                           "No fixed range  ·  MACD > Signal is bullish  ·  MACD < Signal is bearish"))
 
     if ind["sma50"] is not None:
         if ind["price"] > ind["sma50"]:
             score += 1
-            breakdown.append(("Price vs 50-day avg", f"₹{ind['price']} vs ₹{ind['sma50']}", "🟢 Bullish", "Above 50-day average — short-term uptrend"))
+            breakdown.append(("Price vs 50-day avg", f"₹{ind['price']} vs ₹{ind['sma50']}", "🟢 Bullish", "Above 50-day average — short-term uptrend",
+                               "Price above = bullish  ·  Price below = bearish (short-term, ~2-3 months)"))
         else:
             score -= 1
-            breakdown.append(("Price vs 50-day avg", f"₹{ind['price']} vs ₹{ind['sma50']}", "🔴 Bearish", "Below 50-day average — short-term downtrend"))
+            breakdown.append(("Price vs 50-day avg", f"₹{ind['price']} vs ₹{ind['sma50']}", "🔴 Bearish", "Below 50-day average — short-term downtrend",
+                               "Price above = bullish  ·  Price below = bearish (short-term, ~2-3 months)"))
 
     if ind["sma200"] is not None:
         if ind["price"] > ind["sma200"]:
             score += 1
-            breakdown.append(("Price vs 200-day avg", f"₹{ind['price']} vs ₹{ind['sma200']}", "🟢 Bullish", "Above 200-day average — long-term uptrend"))
+            breakdown.append(("Price vs 200-day avg", f"₹{ind['price']} vs ₹{ind['sma200']}", "🟢 Bullish", "Above 200-day average — long-term uptrend",
+                               "Price above = bullish  ·  Price below = bearish (long-term, ~1 year)"))
         else:
             score -= 1
-            breakdown.append(("Price vs 200-day avg", f"₹{ind['price']} vs ₹{ind['sma200']}", "🔴 Bearish", "Below 200-day average — long-term downtrend"))
+            breakdown.append(("Price vs 200-day avg", f"₹{ind['price']} vs ₹{ind['sma200']}", "🔴 Bearish", "Below 200-day average — long-term downtrend",
+                               "Price above = bullish  ·  Price below = bearish (long-term, ~1 year)"))
 
     if score >= 2:
         signal = "BUY"
@@ -417,7 +448,7 @@ with tab1:
 
                 with st.expander("📐 Why this rating? — see the basis for the score"):
                     st.dataframe(
-                        pd.DataFrame(breakdown, columns=["Indicator", "Value", "Signal", "Why"]),
+                        pd.DataFrame(breakdown, columns=["Indicator", "Value", "Signal", "Why", "Typical Range"]),
                         hide_index=True, use_container_width=True,
                     )
                     st.caption("Score ranges -4 (all bearish) to +4 (all bullish). ≥2 → BUY, ≤-2 → SELL, else → HOLD.")
