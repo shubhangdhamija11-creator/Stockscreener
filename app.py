@@ -103,22 +103,30 @@ st.sidebar.caption("Educational, rule-based tool. Not financial advice.")
 with st.sidebar.expander("📖 Indicator cheat sheet"):
     st.markdown(
         """
-**RSI (14)** — range 0 to 100
-- Below 30 → oversold, often a buy signal
-- 30–70 → neutral, no strong signal
-- Above 70 → overbought, often a sell signal
+**200 SMA (structural gate)**
+- Price above = safe zone, buy signals valid
+- Price below = avoid all buys (structurally broken)
 
-**MACD vs Signal line** — no fixed range
-- MACD above Signal → bullish momentum
-- MACD below Signal → bearish momentum
+**EMA trend (20 vs 50)**
+- 20 EMA above 50 EMA → uptrend
+- 20 EMA below 50 EMA → downtrend
 
-**Price vs 50-day average** — short-term trend (~2–3 months)
-- Price above it → uptrend
-- Price below it → downtrend
+**Fast EMA (9 vs 20)**
+- 9 EMA crosses above 20 EMA → entry trigger
+- 9 EMA crosses below 20 EMA → exit trigger
 
-**Price vs 200-day average** — long-term trend (~1 year)
-- Price above it → uptrend
-- Price below it → downtrend
+**RSI (14)** — range 0–100
+- Above 55 → momentum building, trend-continuation buy
+- 45–55 → neutral
+- Below 45 → momentum weak/bearish
+
+**MACD vs Signal line**
+- MACD above Signal → bullish crossover
+- MACD below Signal → bearish crossover
+
+**Volume vs 10-day average**
+- ≥1.5x average → high conviction move
+- <0.8x average → weak, don't trust the move
         """
     )
 
@@ -217,72 +225,171 @@ def compute_macd(close: pd.Series):
 
 
 def compute_indicators(df: pd.DataFrame) -> dict:
-    close = df["Close"]
-    rsi = compute_rsi(close)
-    macd_line, signal_line = compute_macd(close)
-    sma50 = close.rolling(50).mean()
+    close  = df["Close"]
+    volume = df["Volume"]
+
+    rsi             = compute_rsi(close)
+    macd_line, sig_line = compute_macd(close)
+
+    ema9   = close.ewm(span=9,   adjust=False).mean()
+    ema20  = close.ewm(span=20,  adjust=False).mean()
+    ema50  = close.ewm(span=50,  adjust=False).mean()
     sma200 = close.rolling(200).mean()
+
+    vol_avg10 = volume.rolling(10).mean()
+
+    def _f(s): return round(float(s.iloc[-1]), 2) if pd.notna(s.iloc[-1]) else None
+
     return {
-        "price": round(float(close.iloc[-1]), 2),
-        "rsi": round(float(rsi.iloc[-1]), 2) if pd.notna(rsi.iloc[-1]) else None,
-        "macd": round(float(macd_line.iloc[-1]), 2),
-        "macd_signal": round(float(signal_line.iloc[-1]), 2),
-        "sma50": round(float(sma50.iloc[-1]), 2) if pd.notna(sma50.iloc[-1]) else None,
-        "sma200": round(float(sma200.iloc[-1]), 2) if pd.notna(sma200.iloc[-1]) else None,
+        "price":      round(float(close.iloc[-1]), 2),
+        "rsi":        _f(rsi),
+        "macd":       _f(macd_line),
+        "macd_signal":_f(sig_line),
+        "ema9":       _f(ema9),
+        "ema20":      _f(ema20),
+        "ema50":      _f(ema50),
+        "sma200":     _f(sma200),
+        "volume":     int(volume.iloc[-1]),
+        "vol_avg10":  int(vol_avg10.iloc[-1]) if pd.notna(vol_avg10.iloc[-1]) else None,
     }
 
+
+# ---- Scoring rules (from the two strategy documents) ----
+# Each rule contributes +1 (bullish) or -1 (bearish) or 0 (neutral).
+# Max possible score = +6, min = -6.
+# BUY requires ≥ 4, SELL requires ≤ -4, else HOLD.
+# The 200 SMA structural filter is a hard gate:
+#   if price is BELOW 200 SMA the strategy says "never buy" -- no BUY signal at all.
 
 def compute_signal(ind: dict):
     breakdown = []
     score = 0
-    if ind["rsi"] is not None:
-        if ind["rsi"] < 30:
-            score += 1
-            breakdown.append(("RSI (14)", ind["rsi"], "🟢 Bullish", "Below 30 — may be oversold",
-                               "0–100  ·  <30 buy zone  ·  30–70 neutral  ·  >70 sell zone"))
-        elif ind["rsi"] > 70:
-            score -= 1
-            breakdown.append(("RSI (14)", ind["rsi"], "🔴 Bearish", "Above 70 — may be overbought",
-                               "0–100  ·  <30 buy zone  ·  30–70 neutral  ·  >70 sell zone"))
-        else:
-            breakdown.append(("RSI (14)", ind["rsi"], "⚪ Neutral", "Between 30-70 — no extreme",
-                               "0–100  ·  <30 buy zone  ·  30–70 neutral  ·  >70 sell zone"))
 
-    if ind["macd"] > ind["macd_signal"]:
-        score += 1
-        breakdown.append(("MACD", f"{ind['macd']} vs {ind['macd_signal']}", "🟢 Bullish", "MACD above signal — upward momentum",
-                           "No fixed range  ·  MACD > Signal is bullish  ·  MACD < Signal is bearish"))
-    else:
-        score -= 1
-        breakdown.append(("MACD", f"{ind['macd']} vs {ind['macd_signal']}", "🔴 Bearish", "MACD below signal — downward momentum",
-                           "No fixed range  ·  MACD > Signal is bullish  ·  MACD < Signal is bearish"))
-
-    if ind["sma50"] is not None:
-        if ind["price"] > ind["sma50"]:
-            score += 1
-            breakdown.append(("Price vs 50-day avg", f"₹{ind['price']} vs ₹{ind['sma50']}", "🟢 Bullish", "Above 50-day average — short-term uptrend",
-                               "Price above = bullish  ·  Price below = bearish (short-term, ~2-3 months)"))
-        else:
-            score -= 1
-            breakdown.append(("Price vs 50-day avg", f"₹{ind['price']} vs ₹{ind['sma50']}", "🔴 Bearish", "Below 50-day average — short-term downtrend",
-                               "Price above = bullish  ·  Price below = bearish (short-term, ~2-3 months)"))
-
+    # ── 1. STRUCTURAL FILTER: Price vs 200 SMA ──────────────────────────────
+    above_200 = ind["sma200"] is not None and ind["price"] > ind["sma200"]
     if ind["sma200"] is not None:
-        if ind["price"] > ind["sma200"]:
+        if above_200:
             score += 1
-            breakdown.append(("Price vs 200-day avg", f"₹{ind['price']} vs ₹{ind['sma200']}", "🟢 Bullish", "Above 200-day average — long-term uptrend",
-                               "Price above = bullish  ·  Price below = bearish (long-term, ~1 year)"))
+            breakdown.append((
+                "200 SMA structural filter", f"₹{ind['price']} vs ₹{ind['sma200']}",
+                "🟢 Bullish", "Price above 200 SMA — long-term uptrend intact",
+                "Price ABOVE = safe to trade  ·  Price BELOW = avoid all buy signals",
+            ))
         else:
             score -= 1
-            breakdown.append(("Price vs 200-day avg", f"₹{ind['price']} vs ₹{ind['sma200']}", "🔴 Bearish", "Below 200-day average — long-term downtrend",
-                               "Price above = bullish  ·  Price below = bearish (long-term, ~1 year)"))
+            breakdown.append((
+                "200 SMA structural filter", f"₹{ind['price']} vs ₹{ind['sma200']}",
+                "🔴 Bearish", "Price below 200 SMA — structurally compromised, avoid buys",
+                "Price ABOVE = safe to trade  ·  Price BELOW = avoid all buy signals",
+            ))
 
-    if score >= 2:
+    # ── 2. TREND DIRECTION: 20 EMA vs 50 EMA ────────────────────────────────
+    if ind["ema20"] is not None and ind["ema50"] is not None:
+        if ind["ema20"] > ind["ema50"]:
+            score += 1
+            breakdown.append((
+                "EMA trend (20 vs 50)", f"₹{ind['ema20']} vs ₹{ind['ema50']}",
+                "🟢 Bullish", "20 EMA above 50 EMA — short-term momentum upward",
+                "20 EMA above 50 EMA = uptrend  ·  below = downtrend",
+            ))
+        else:
+            score -= 1
+            breakdown.append((
+                "EMA trend (20 vs 50)", f"₹{ind['ema20']} vs ₹{ind['ema50']}",
+                "🔴 Bearish", "20 EMA below 50 EMA — short-term momentum downward",
+                "20 EMA above 50 EMA = uptrend  ·  below = downtrend",
+            ))
+
+    # ── 3. FAST MOMENTUM: 9 EMA vs 21 EMA (Doc 2 Setup 1) ───────────────────
+    if ind["ema9"] is not None and ind["ema20"] is not None:
+        if ind["ema9"] > ind["ema20"]:
+            score += 1
+            breakdown.append((
+                "Fast EMA (9 vs 20)", f"₹{ind['ema9']} vs ₹{ind['ema20']}",
+                "🟢 Bullish", "9 EMA crossed above 20 EMA — quick momentum burst",
+                "9 EMA above 20 EMA = entry trigger  ·  below = exit trigger",
+            ))
+        else:
+            score -= 1
+            breakdown.append((
+                "Fast EMA (9 vs 20)", f"₹{ind['ema9']} vs ₹{ind['ema20']}",
+                "🔴 Bearish", "9 EMA below 20 EMA — momentum fading",
+                "9 EMA above 20 EMA = entry trigger  ·  below = exit trigger",
+            ))
+
+    # ── 4. RSI MOMENTUM CONFIRMATION (Doc 1: RSI > 55 = momentum buy) ───────
+    if ind["rsi"] is not None:
+        if ind["rsi"] > 55:
+            score += 1
+            breakdown.append((
+                "RSI (14)", ind["rsi"], "🟢 Bullish",
+                "Above 55 — momentum is building (trend-continuation buy zone)",
+                "0–100  ·  >55 momentum buy  ·  45–55 neutral  ·  <45 weak/bearish",
+            ))
+        elif ind["rsi"] < 45:
+            score -= 1
+            breakdown.append((
+                "RSI (14)", ind["rsi"], "🔴 Bearish",
+                "Below 45 — momentum weakening",
+                "0–100  ·  >55 momentum buy  ·  45–55 neutral  ·  <45 weak/bearish",
+            ))
+        else:
+            breakdown.append((
+                "RSI (14)", ind["rsi"], "⚪ Neutral",
+                "Between 45–55 — no strong momentum signal",
+                "0–100  ·  >55 momentum buy  ·  45–55 neutral  ·  <45 weak/bearish",
+            ))
+
+    # ── 5. MACD CROSSOVER (both docs agree) ──────────────────────────────────
+    if ind["macd"] is not None and ind["macd_signal"] is not None:
+        if ind["macd"] > ind["macd_signal"]:
+            score += 1
+            breakdown.append((
+                "MACD crossover", f"{ind['macd']} vs {ind['macd_signal']}",
+                "🟢 Bullish", "MACD above signal line — bullish crossover confirmed",
+                "MACD > Signal = bullish  ·  MACD < Signal = bearish",
+            ))
+        else:
+            score -= 1
+            breakdown.append((
+                "MACD crossover", f"{ind['macd']} vs {ind['macd_signal']}",
+                "🔴 Bearish", "MACD below signal line — bearish crossover",
+                "MACD > Signal = bullish  ·  MACD < Signal = bearish",
+            ))
+
+    # ── 6. VOLUME CONFIRMATION (Doc 1: ≥ 1.5x 10-period avg) ────────────────
+    if ind["vol_avg10"] is not None and ind["vol_avg10"] > 0:
+        vol_ratio = ind["volume"] / ind["vol_avg10"]
+        if vol_ratio >= 1.5:
+            score += 1
+            breakdown.append((
+                "Volume confirmation", f"{vol_ratio:.1f}x avg",
+                "🟢 Bullish", f"Volume is {vol_ratio:.1f}x the 10-day average — strong conviction",
+                "≥1.5x avg = high conviction  ·  1–1.5x = normal  ·  <1x = weak",
+            ))
+        elif vol_ratio < 0.8:
+            score -= 1
+            breakdown.append((
+                "Volume confirmation", f"{vol_ratio:.1f}x avg",
+                "🔴 Bearish", "Volume well below average — move lacks conviction",
+                "≥1.5x avg = high conviction  ·  1–1.5x = normal  ·  <1x = weak",
+            ))
+        else:
+            breakdown.append((
+                "Volume confirmation", f"{vol_ratio:.1f}x avg",
+                "⚪ Neutral", "Volume near average — no strong confirmation",
+                "≥1.5x avg = high conviction  ·  1–1.5x = normal  ·  <1x = weak",
+            ))
+
+    max_score = 6
+    # Hard structural gate from Doc 2: never show BUY when below 200 SMA
+    if score >= 4 and above_200:
         signal = "BUY"
-    elif score <= -2:
+    elif score <= -4:
         signal = "SELL"
     else:
         signal = "HOLD"
+
     return signal, score, breakdown
 
 
@@ -309,28 +416,59 @@ def multi_timeframe_view(daily_df: pd.DataFrame, extended_df: pd.DataFrame) -> p
 
 
 def compute_score_series(df: pd.DataFrame):
-    """Vectorized version of compute_signal -- same rules, applied to every row
-    at once so we can backtest instead of just reading the latest value."""
-    close = df["Close"]
-    rsi = compute_rsi(close)
-    macd_line, signal_line = compute_macd(close)
-    sma50 = close.rolling(50).mean()
-    sma200 = close.rolling(200).mean()
+    """Vectorized version of compute_signal — same 6-factor rules applied to
+    every historical row so the backtest uses exactly the same logic as the
+    live signal. Score range: -6 to +6. BUY = ≥4 AND above 200 SMA."""
+    close  = df["Close"]
+    volume = df["Volume"]
 
-    rsi_pts = np.select([rsi < 30, rsi > 70], [1, -1], default=0)
-    rsi_pts = np.where(rsi.isna(), 0, rsi_pts)
+    rsi        = compute_rsi(close)
+    macd_line, sig_line = compute_macd(close)
+    ema9       = close.ewm(span=9,   adjust=False).mean()
+    ema20      = close.ewm(span=20,  adjust=False).mean()
+    ema50      = close.ewm(span=50,  adjust=False).mean()
+    sma200     = close.rolling(200).mean()
+    vol_avg10  = volume.rolling(10).mean()
 
-    macd_pts = np.where(macd_line > signal_line, 1, -1)
-    macd_pts = np.where(macd_line.isna() | signal_line.isna(), 0, macd_pts)
-
-    sma50_pts = np.where(close > sma50, 1, -1)
-    sma50_pts = np.where(sma50.isna(), 0, sma50_pts)
-
+    # 1. 200 SMA structural filter
     sma200_pts = np.where(close > sma200, 1, -1)
     sma200_pts = np.where(sma200.isna(), 0, sma200_pts)
+    above_200  = close > sma200
 
-    score = pd.Series(rsi_pts + macd_pts + sma50_pts + sma200_pts, index=df.index)
-    signal = pd.Series(np.select([score >= 2, score <= -2], ["BUY", "SELL"], default="HOLD"), index=df.index)
+    # 2. EMA trend: 20 vs 50
+    ema_trend_pts = np.where(ema20 > ema50, 1, -1)
+    ema_trend_pts = np.where(ema20.isna() | ema50.isna(), 0, ema_trend_pts)
+
+    # 3. Fast EMA: 9 vs 20
+    fast_ema_pts = np.where(ema9 > ema20, 1, -1)
+    fast_ema_pts = np.where(ema9.isna() | ema20.isna(), 0, fast_ema_pts)
+
+    # 4. RSI > 55 momentum buy
+    rsi_pts = np.select([rsi > 55, rsi < 45], [1, -1], default=0)
+    rsi_pts = np.where(rsi.isna(), 0, rsi_pts)
+
+    # 5. MACD crossover
+    macd_pts = np.where(macd_line > sig_line, 1, -1)
+    macd_pts = np.where(macd_line.isna() | sig_line.isna(), 0, macd_pts)
+
+    # 6. Volume >= 1.5x 10-day avg
+    vol_ratio  = volume / vol_avg10.replace(0, np.nan)
+    vol_pts    = np.select([vol_ratio >= 1.5, vol_ratio < 0.8], [1, -1], default=0)
+    vol_pts    = np.where(vol_avg10.isna(), 0, vol_pts)
+
+    score = pd.Series(
+        sma200_pts + ema_trend_pts + fast_ema_pts + rsi_pts + macd_pts + vol_pts,
+        index=df.index,
+    )
+    # Hard gate: never BUY below 200 SMA
+    signal = pd.Series(
+        np.select(
+            [(score >= 4) & above_200, score <= -4],
+            ["BUY", "SELL"],
+            default="HOLD",
+        ),
+        index=df.index,
+    )
     return score, signal
 
 
@@ -396,61 +534,6 @@ def make_backtest_chart(cum_strategy: pd.Series, cum_buyhold: pd.Series) -> go.F
         font=dict(color="#E5E7EB"),
     )
     return fig
-    close = df["Close"]
-    sma50 = close.rolling(50).mean()
-    sma200 = close.rolling(200).mean()
-
-    bb_mid = close.rolling(20).mean()
-    bb_std = close.rolling(20).std()
-    bb_upper = bb_mid + 2 * bb_std
-    bb_lower = bb_mid - 2 * bb_std
-
-    week52_high = df["High"].max()
-    week52_low = df["Low"].min()
-    vol_colors = [GREEN if c >= o else RED for o, c in zip(df["Open"], df["Close"])]
-
-    fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True,
-        row_heights=[0.72, 0.28], vertical_spacing=0.04,
-    )
-
-    # Bollinger Band shading (upper trace invisible, lower trace fills back up to it)
-    fig.add_trace(go.Scatter(x=df.index, y=bb_upper, line=dict(width=0),
-                              showlegend=False, hoverinfo="skip"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=bb_lower, line=dict(width=0), fill="tonexty",
-                              fillcolor="rgba(99,102,241,0.15)", name="Bollinger Band (20,2)",
-                              hoverinfo="skip"), row=1, col=1)
-
-    fig.add_trace(go.Scatter(x=df.index, y=close, name="Price",
-                              line=dict(color=GREEN, width=2)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=sma50, name="50-day avg",
-                              line=dict(color=AMBER, width=1.3, dash="dot")), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=sma200, name="200-day avg",
-                              line=dict(color=RED, width=1.3, dash="dot")), row=1, col=1)
-
-    fig.add_hline(y=week52_high, line=dict(color="rgba(229,231,235,0.4)", dash="dash", width=1),
-                  annotation_text="52w High", annotation_font_size=10,
-                  annotation_position="top left", row=1, col=1)
-    fig.add_hline(y=week52_low, line=dict(color="rgba(229,231,235,0.4)", dash="dash", width=1),
-                  annotation_text="52w Low", annotation_font_size=10,
-                  annotation_position="bottom left", row=1, col=1)
-
-    fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Volume",
-                          marker_color=vol_colors, showlegend=False), row=2, col=1)
-
-    fig.update_layout(
-        height=420,
-        margin=dict(l=10, r=10, t=10, b=10),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        hovermode="x unified",
-        font=dict(color="#E5E7EB"),
-    )
-    fig.update_xaxes(showgrid=False)
-    fig.update_yaxes(showgrid=True, gridcolor="rgba(255,255,255,0.1)", row=1, col=1)
-    fig.update_yaxes(showgrid=False, title_text="Volume", title_font_size=10, row=2, col=1)
-    return fig
 
 
 def make_gauge(score: int) -> go.Figure:
@@ -459,13 +542,13 @@ def make_gauge(score: int) -> go.Figure:
         value=score,
         number={"font": {"size": 34}},
         gauge={
-            "axis": {"range": [-4, 4], "tickwidth": 1},
+            "axis": {"range": [-6, 6], "tickwidth": 1},
             "bar": {"color": "#E5E7EB", "thickness": 0.25},
             "bgcolor": "rgba(0,0,0,0)",
             "steps": [
-                {"range": [-4, -2], "color": RED},
-                {"range": [-2, 2], "color": AMBER},
-                {"range": [2, 4], "color": GREEN},
+                {"range": [-6, -4], "color": RED},
+                {"range": [-4, 4],  "color": AMBER},
+                {"range": [4, 6],   "color": GREEN},
             ],
         },
     ))
@@ -541,32 +624,12 @@ tab1, tab2, tab3 = st.tabs(["🔍 Analyze a Stock", "📋 Screen a List", "🧪 
 
 # ===== TAB 1: single-stock deep dive =====
 with tab1:
-    st.subheader("Quick picks")
-    quick_pick_clicked = None
-    cols = st.columns(4)
-    for i, sym in enumerate(QUICK_PICKS):
-        if cols[i % 4].button(sym, use_container_width=True, key=f"qp_{sym}"):
-            quick_pick_clicked = sym
-
-    st.subheader("Or search")
-    stock_options = [f"{name} ({sym})" for sym, name in sorted(NSE_STOCKS.items(), key=lambda x: x[1])]
-    selected_option = st.selectbox(
-        "Type a company name or symbol — matching results filter as you type",
-        options=["— Select a stock —"] + stock_options,
-        index=0,
+    search_input = st.text_input(
+        "Enter NSE/BSE symbol (e.g. RELIANCE, TCS, HDFCBANK)",
+        placeholder="Type a ticker symbol and press Analyze",
     )
-    custom_symbol = st.text_input("Not listed? Enter the exact NSE/BSE symbol here")
     analyze_clicked = st.button("Analyze 📊", type="primary", use_container_width=True)
-
-    raw_input = None
-    if quick_pick_clicked:
-        raw_input = quick_pick_clicked
-    elif analyze_clicked:
-        if custom_symbol.strip():
-            raw_input = custom_symbol.strip()
-        elif selected_option != "— Select a stock —":
-            match = re.search(r"\(([^)]+)\)$", selected_option)
-            raw_input = match.group(1) if match else None
+    raw_input = search_input.strip() if analyze_clicked and search_input.strip() else None
 
     if raw_input:
         with st.spinner("Fetching data..."):
@@ -587,18 +650,18 @@ with tab1:
                 with st.container(border=True):
                     st.subheader(f"{fundamentals.get('longName', symbol)} ({symbol})")
                     if signal == "BUY":
-                        st.success(f"🟢 **BUY** — signal score {score} / 4")
+                        st.success(f"🟢 **BUY** — signal score {score} / 6")
                     elif signal == "SELL":
-                        st.error(f"🔴 **SELL** — signal score {score} / 4")
+                        st.error(f"🔴 **SELL** — signal score {score} / 6")
                     else:
-                        st.warning(f"🟡 **HOLD** — signal score {score} / 4")
+                        st.warning(f"🟡 **HOLD** — signal score {score} / 6")
                     st.plotly_chart(make_gauge(score), use_container_width=True, config={"displayModeBar": False})
 
                     col1, col2 = st.columns(2)
                     with col1:
                         st.metric("Price", f"₹{indicators['price']}")
                         st.metric("RSI (14)", indicators["rsi"])
-                        st.caption("🟢 <30 buy zone · ⚪ 30–70 neutral · 🔴 >70 sell zone")
+                        st.caption("🟢 >55 momentum buy · ⚪ 45–55 neutral · 🔴 <45 weak")
                     with col2:
                         st.metric("MACD", indicators["macd"])
                         st.metric("Signal Line", indicators["macd_signal"])
@@ -615,7 +678,12 @@ with tab1:
                         pd.DataFrame(breakdown, columns=["Indicator", "Value", "Signal", "Why", "Typical Range"]),
                         hide_index=True, use_container_width=True,
                     )
-                    st.caption("Score ranges -4 (all bearish) to +4 (all bullish). ≥2 → BUY, ≤-2 → SELL, else → HOLD.")
+                    st.caption(
+                        "Score ranges -6 (all bearish) to +6 (all bullish). "
+                        "≥4 AND above 200 SMA → BUY  ·  ≤-4 → SELL  ·  else → HOLD. "
+                        "Strategy based on trend-continuation rules: 200 SMA gate, EMA alignment, "
+                        "RSI>55 momentum, MACD crossover, volume confirmation."
+                    )
 
                 with st.expander("💰 Fundamentals"):
                     if fundamentals:
@@ -715,9 +783,9 @@ with tab2:
 with tab3:
     st.subheader("🧪 Backtest the signal")
     st.caption(
-        "Runs the exact same RSI + MACD + moving-average score against ~5 years of "
-        "history and checks what actually happened afterward. This is the honest way "
-        "to see how reliable the signal really is, instead of just trusting it."
+        "Runs the new 6-factor strategy (200 SMA gate · EMA alignment · Fast EMA · "
+        "RSI>55 · MACD crossover · Volume) against ~5 years of history and checks "
+        "what actually happened afterward. BUY requires score ≥4 AND price above 200 SMA."
     )
     st.warning(
         "⚠️ No transaction costs, taxes, or slippage are modeled. Past performance on "
@@ -726,26 +794,18 @@ with tab3:
         icon="⚠️",
     )
 
-    bt_options = [f"{name} ({sym})" for sym, name in sorted(NSE_STOCKS.items(), key=lambda x: x[1])]
-    bt_selected = st.selectbox(
-        "Pick a stock to backtest",
-        options=["— Select a stock —"] + bt_options,
-        index=0,
-        key="bt_select",
+    bt_search = st.text_input(
+        "Enter NSE/BSE symbol to backtest (e.g. RELIANCE, TCS, HDFCBANK)",
+        placeholder="Any NSE/BSE stock — type the symbol",
+        key="bt_search",
     )
-    bt_custom = st.text_input("Or enter a custom NSE/BSE symbol", key="bt_custom")
     run_bt = st.button("Run backtest 🧪", type="primary", use_container_width=True)
 
     if run_bt:
-        bt_raw = None
-        if bt_custom.strip():
-            bt_raw = bt_custom.strip()
-        elif bt_selected != "— Select a stock —":
-            match = re.search(r"\(([^)]+)\)$", bt_selected)
-            bt_raw = match.group(1) if match else None
+        bt_raw = bt_search.strip() if bt_search.strip() else None
 
         if not bt_raw:
-            st.error("Pick a stock or enter a symbol first.")
+            st.error("Enter an NSE/BSE symbol first.")
         else:
             with st.spinner("Fetching ~5 years of history and running the backtest..."):
                 bt_symbol, _ = resolve_ticker(bt_raw)
@@ -778,6 +838,62 @@ with tab3:
                         "Strategy = only invested on days after a BUY signal, in cash otherwise. "
                         "Compare it to simply buying and holding the whole time."
                     )
+
+                    # ── Plain-English verdict ─────────────────────────────
+                    st.subheader("🗣️ What do these results actually mean?")
+                    buy_rows = summary_df[summary_df["Signal"] == "BUY"]
+                    beat = total_strategy_return > total_buyhold_return
+                    buy_wr_1m = buy_rows["Win rate % (~1 month)"].values[0] if len(buy_rows) else None
+                    buy_ret_1m = buy_rows["Avg return (~1 month)"].values[0] if len(buy_rows) else None
+                    buy_occ = buy_rows["Occurrences"].values[0] if len(buy_rows) else 0
+
+                    verdict_lines = []
+                    verdict_lines.append(
+                        f"**Signal frequency:** The strategy produced a BUY signal on **{buy_occ} days** "
+                        f"out of the ~{len(ext_df)} trading days tested (~{round(buy_occ/max(len(ext_df),1)*100)}% of the time). "
+                        "Fewer signals = more selective = each signal carries more weight."
+                    )
+                    if buy_wr_1m is not None:
+                        if buy_wr_1m >= 60:
+                            verdict_lines.append(
+                                f"**1-month win rate: {buy_wr_1m}% ✅** — historically, more than 6 out of 10 BUY signals "
+                                "were followed by a gain one month later. That's a meaningful edge."
+                            )
+                        elif buy_wr_1m >= 50:
+                            verdict_lines.append(
+                                f"**1-month win rate: {buy_wr_1m}% ⚠️** — just above 50%. Marginally better than a coin flip. "
+                                "Not strong enough to rely on alone."
+                            )
+                        else:
+                            verdict_lines.append(
+                                f"**1-month win rate: {buy_wr_1m}% ❌** — below 50%. The BUY signal was followed by a loss "
+                                "more often than a gain. The strategy didn't work well on this stock historically."
+                            )
+                    if buy_ret_1m is not None:
+                        sign = "positive" if buy_ret_1m > 0 else "negative"
+                        verdict_lines.append(
+                            f"**Avg 1-month return after BUY: {buy_ret_1m}%** — on average the stock moved "
+                            f"{abs(buy_ret_1m)}% in a {sign} direction in the month after a BUY signal."
+                        )
+                    if beat:
+                        verdict_lines.append(
+                            f"**Strategy vs Buy & Hold: Strategy won ✅** — the signal-based approach returned "
+                            f"{total_strategy_return:.1f}% vs {total_buyhold_return:.1f}% for simply holding. "
+                            "It added value on this stock over this time period."
+                        )
+                    else:
+                        verdict_lines.append(
+                            f"**Strategy vs Buy & Hold: Buy & Hold won ❌** — simply holding returned "
+                            f"{total_buyhold_return:.1f}% vs {total_strategy_return:.1f}% for the strategy. "
+                            "The signals caused you to miss some of the uptrend by being in cash too often."
+                        )
+                    verdict_lines.append(
+                        "⚠️ **Remember:** This is one stock over one historical window. "
+                        "Test 5–10 different stocks before drawing any conclusions. "
+                        "Past results never guarantee future performance."
+                    )
+                    for line in verdict_lines:
+                        st.markdown(f"- {line}")
 
 st.divider()
 st.caption(
