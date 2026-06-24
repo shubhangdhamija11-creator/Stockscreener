@@ -516,14 +516,68 @@ def run_backtest(df: pd.DataFrame, holding_days=(5, 20, 60)):
     return summary_df, cum_strategy, cum_buyhold
 
 
-def make_backtest_chart(cum_strategy: pd.Series, cum_buyhold: pd.Series) -> go.Figure:
+def run_hybrid_backtest(df: pd.DataFrame):
+    """Hybrid approach based on the 8-stock backtest findings:
+    - ENTER when score >= 4 AND above 200 SMA (same as before)
+    - STAY IN (ignore dips) unless score drops to <= -4 (hard structural breakdown)
+    - This stops the strategy from exiting on every minor pullback during a bull run
+    No transaction costs, taxes, or slippage modeled."""
+    df = df.copy()
+    score, _ = compute_score_series(df)
+    close = df["Close"]
+    daily_return = close.pct_change()
+
+    warmup = 200
+    if len(df) <= warmup + 60:
+        return None, None, None
+
+    # State machine: once IN, only exit on hard SELL (score <= -4)
+    in_position = False
+    position_flags = []
+    for i, (s, sc) in enumerate(zip(score, score.index)):
+        above_200 = not pd.isna(close[sc]) and not pd.isna(close.rolling(200).mean()[sc]) and \
+                    close[sc] > close.rolling(200).mean()[sc]
+        if not in_position:
+            if s >= 4 and above_200:
+                in_position = True
+        else:
+            if s <= -4:
+                in_position = False
+        position_flags.append(in_position)
+
+    position = pd.Series(position_flags, index=df.index)
+    acted_position = position.shift(1).fillna(False)  # no lookahead
+
+    hybrid_return = daily_return.where(acted_position, 0.0)
+
+    strat_window   = hybrid_return.iloc[warmup:].fillna(0)
+    hold_window    = daily_return.iloc[warmup:].fillna(0)
+    cum_hybrid     = (1 + strat_window).cumprod()
+    cum_buyhold    = (1 + hold_window).cumprod()
+
+    # How many times did we enter/exit?
+    entries = position.diff().fillna(0)
+    n_trades = int((entries == 1).sum())
+    avg_hold = int(position.sum() / max(n_trades, 1))
+
+    return cum_hybrid, cum_buyhold, n_trades, avg_hold
+
+
+def make_backtest_chart(cum_strategy: pd.Series, cum_buyhold: pd.Series,
+                        cum_hybrid: pd.Series = None) -> go.Figure:
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=cum_strategy.index, y=cum_strategy, name="Signal strategy (long only on BUY)",
-                              line=dict(color=GREEN, width=2)))
-    fig.add_trace(go.Scatter(x=cum_buyhold.index, y=cum_buyhold, name="Just buy & hold",
+    fig.add_trace(go.Scatter(x=cum_strategy.index, y=cum_strategy,
+                              name="Original strategy (in/out on every signal)",
+                              line=dict(color=AMBER, width=2)))
+    fig.add_trace(go.Scatter(x=cum_buyhold.index, y=cum_buyhold,
+                              name="Buy & hold",
                               line=dict(color="#9CA3AF", width=2, dash="dot")))
+    if cum_hybrid is not None:
+        fig.add_trace(go.Scatter(x=cum_hybrid.index, y=cum_hybrid,
+                                  name="Hybrid (hold through dips, exit only on breakdown)",
+                                  line=dict(color=GREEN, width=2.5)))
     fig.update_layout(
-        height=280,
+        height=300,
         margin=dict(l=10, r=10, t=10, b=10),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         paper_bgcolor="rgba(0,0,0,0)",
@@ -533,6 +587,65 @@ def make_backtest_chart(cum_strategy: pd.Series, cum_buyhold: pd.Series) -> go.F
         hovermode="x unified",
         font=dict(color="#E5E7EB"),
     )
+    return fig
+
+
+def make_price_chart(df: pd.DataFrame) -> go.Figure:
+    close  = df["Close"]
+    sma50  = close.rolling(50).mean()
+    sma200 = close.rolling(200).mean()
+    ema20  = close.ewm(span=20, adjust=False).mean()
+
+    bb_mid   = close.rolling(20).mean()
+    bb_std   = close.rolling(20).std()
+    bb_upper = bb_mid + 2 * bb_std
+    bb_lower = bb_mid - 2 * bb_std
+
+    week52_high = df["High"].max()
+    week52_low  = df["Low"].min()
+    vol_colors  = [GREEN if c >= o else RED for o, c in zip(df["Open"], df["Close"])]
+
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True,
+        row_heights=[0.72, 0.28], vertical_spacing=0.04,
+    )
+
+    # Bollinger Band shading
+    fig.add_trace(go.Scatter(x=df.index, y=bb_upper, line=dict(width=0),
+                              showlegend=False, hoverinfo="skip"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=bb_lower, line=dict(width=0), fill="tonexty",
+                              fillcolor="rgba(99,102,241,0.15)", name="Bollinger Band (20,2)",
+                              hoverinfo="skip"), row=1, col=1)
+
+    fig.add_trace(go.Scatter(x=df.index, y=close,  name="Price",
+                              line=dict(color=GREEN, width=2)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=ema20,  name="20 EMA",
+                              line=dict(color=AMBER, width=1.3, dash="dot")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=sma200, name="200 SMA",
+                              line=dict(color=RED,   width=1.3, dash="dot")), row=1, col=1)
+
+    fig.add_hline(y=week52_high, line=dict(color="rgba(229,231,235,0.4)", dash="dash", width=1),
+                  annotation_text="52w High", annotation_font_size=10,
+                  annotation_position="top left", row=1, col=1)
+    fig.add_hline(y=week52_low,  line=dict(color="rgba(229,231,235,0.4)", dash="dash", width=1),
+                  annotation_text="52w Low",  annotation_font_size=10,
+                  annotation_position="bottom left", row=1, col=1)
+
+    fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Volume",
+                          marker_color=vol_colors, showlegend=False), row=2, col=1)
+
+    fig.update_layout(
+        height=420,
+        margin=dict(l=10, r=10, t=10, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        hovermode="x unified",
+        font=dict(color="#E5E7EB"),
+    )
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(showgrid=True, gridcolor="rgba(255,255,255,0.1)", row=1, col=1)
+    fig.update_yaxes(showgrid=False, title_text="Volume", title_font_size=10, row=2, col=1)
     return fig
 
 
@@ -815,10 +928,16 @@ with tab3:
                 st.error("Couldn't fetch enough history for this symbol right now — try again shortly.")
             else:
                 summary_df, cum_strategy, cum_buyhold = run_backtest(ext_df)
+                hybrid_result = run_hybrid_backtest(ext_df)
+
                 if summary_df is None:
                     st.error("Not enough history available for a meaningful backtest on this stock.")
                 else:
+                    cum_hybrid, _, n_trades, avg_hold = hybrid_result if hybrid_result[0] is not None else (None, None, 0, 0)
+
                     st.markdown(f"#### Results for {bt_symbol}")
+
+                    # ── Signal stats table ────────────────────────────────
                     st.dataframe(summary_df, hide_index=True, use_container_width=True)
                     st.caption(
                         "'Occurrences' = how many days in the backtest had that signal. "
@@ -826,26 +945,42 @@ with tab3:
                         "'Win rate' = % of the time the return was positive."
                     )
 
+                    # ── Three-way return comparison ───────────────────────
                     total_strategy_return = (cum_strategy.iloc[-1] - 1) * 100
-                    total_buyhold_return = (cum_buyhold.iloc[-1] - 1) * 100
-                    c1, c2 = st.columns(2)
-                    c1.metric("Strategy total return", f"{total_strategy_return:.1f}%")
-                    c2.metric("Buy & hold total return", f"{total_buyhold_return:.1f}%")
+                    total_buyhold_return  = (cum_buyhold.iloc[-1]  - 1) * 100
+                    total_hybrid_return   = (cum_hybrid.iloc[-1]   - 1) * 100 if cum_hybrid is not None else None
 
-                    st.plotly_chart(make_backtest_chart(cum_strategy, cum_buyhold),
-                                     use_container_width=True, config={"displayModeBar": False})
-                    st.caption(
-                        "Strategy = only invested on days after a BUY signal, in cash otherwise. "
-                        "Compare it to simply buying and holding the whole time."
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Original strategy", f"{total_strategy_return:.1f}%",
+                               help="In cash except on BUY signal days")
+                    c2.metric("Buy & hold", f"{total_buyhold_return:.1f}%",
+                               help="Never sells, holds the whole period")
+                    if total_hybrid_return is not None:
+                        c3.metric("🆕 Hybrid strategy", f"{total_hybrid_return:.1f}%",
+                                   help="Enters on BUY, stays in until hard SELL (score ≤-4)")
+
+                    st.plotly_chart(
+                        make_backtest_chart(cum_strategy, cum_buyhold, cum_hybrid),
+                        use_container_width=True, config={"displayModeBar": False}
                     )
+                    st.caption(
+                        "🟡 Original = exits on every signal change  ·  "
+                        "⬛ Buy & hold = never sells  ·  "
+                        "🟢 Hybrid = enters on BUY, only exits on hard structural breakdown (score ≤-4)"
+                    )
+
+                    if total_hybrid_return is not None:
+                        st.info(
+                            f"**Hybrid stats:** {n_trades} trades over the period, "
+                            f"average holding time ~{avg_hold} trading days (~{round(avg_hold/20)} months) per trade."
+                        )
 
                     # ── Plain-English verdict ─────────────────────────────
                     st.subheader("🗣️ What do these results actually mean?")
-                    buy_rows = summary_df[summary_df["Signal"] == "BUY"]
-                    beat = total_strategy_return > total_buyhold_return
+                    buy_rows  = summary_df[summary_df["Signal"] == "BUY"]
                     buy_wr_1m = buy_rows["Win rate % (~1 month)"].values[0] if len(buy_rows) else None
-                    buy_ret_1m = buy_rows["Avg return (~1 month)"].values[0] if len(buy_rows) else None
-                    buy_occ = buy_rows["Occurrences"].values[0] if len(buy_rows) else 0
+                    buy_ret_1m= buy_rows["Avg return (~1 month)"].values[0]  if len(buy_rows) else None
+                    buy_occ   = buy_rows["Occurrences"].values[0]            if len(buy_rows) else 0
 
                     verdict_lines = []
                     verdict_lines.append(
@@ -875,22 +1010,44 @@ with tab3:
                             f"**Avg 1-month return after BUY: {buy_ret_1m}%** — on average the stock moved "
                             f"{abs(buy_ret_1m)}% in a {sign} direction in the month after a BUY signal."
                         )
-                    if beat:
+
+                    # Original vs B&H
+                    if total_strategy_return > total_buyhold_return:
                         verdict_lines.append(
-                            f"**Strategy vs Buy & Hold: Strategy won ✅** — the signal-based approach returned "
-                            f"{total_strategy_return:.1f}% vs {total_buyhold_return:.1f}% for simply holding. "
-                            "It added value on this stock over this time period."
+                            f"**Original strategy vs Buy & Hold: Strategy won ✅** — returned "
+                            f"{total_strategy_return:.1f}% vs {total_buyhold_return:.1f}% for holding."
                         )
                     else:
                         verdict_lines.append(
-                            f"**Strategy vs Buy & Hold: Buy & Hold won ❌** — simply holding returned "
-                            f"{total_buyhold_return:.1f}% vs {total_strategy_return:.1f}% for the strategy. "
-                            "The signals caused you to miss some of the uptrend by being in cash too often."
+                            f"**Original strategy vs Buy & Hold: Buy & Hold won ❌** — "
+                            f"{total_buyhold_return:.1f}% vs {total_strategy_return:.1f}%. "
+                            "Too many exits caused missed uptrend."
                         )
+
+                    # Hybrid vs B&H
+                    if total_hybrid_return is not None:
+                        if total_hybrid_return > total_buyhold_return:
+                            verdict_lines.append(
+                                f"**🆕 Hybrid vs Buy & Hold: Hybrid won ✅** — returned "
+                                f"{total_hybrid_return:.1f}% vs {total_buyhold_return:.1f}% for holding. "
+                                "Staying in through dips and only exiting on hard breakdowns captured more of the trend."
+                            )
+                        elif total_hybrid_return > total_strategy_return:
+                            verdict_lines.append(
+                                f"**🆕 Hybrid improved over original ✅** — {total_hybrid_return:.1f}% vs "
+                                f"{total_strategy_return:.1f}% for original strategy, though Buy & Hold "
+                                f"({total_buyhold_return:.1f}%) still led. The hybrid held longer and missed fewer gains."
+                            )
+                        else:
+                            verdict_lines.append(
+                                f"**🆕 Hybrid: {total_hybrid_return:.1f}%** — didn't beat Buy & Hold on this stock. "
+                                "This tends to happen when a stock had a very steady bull run with few real breakdowns — "
+                                "any active strategy struggles to beat simple holding in that environment."
+                            )
+
                     verdict_lines.append(
-                        "⚠️ **Remember:** This is one stock over one historical window. "
-                        "Test 5–10 different stocks before drawing any conclusions. "
-                        "Past results never guarantee future performance."
+                        "⚠️ **Remember:** No transaction costs, taxes, or slippage are modeled here. "
+                        "Real returns would be lower. Past results never guarantee future performance."
                     )
                     for line in verdict_lines:
                         st.markdown(f"- {line}")
