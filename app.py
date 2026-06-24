@@ -152,6 +152,9 @@ def fetch_fundamentals(ticker: str) -> dict:
         "longName", "currentPrice", "trailingPE", "forwardPE",
         "priceToBook", "returnOnEquity", "debtToEquity",
         "dividendYield", "marketCap", "fiftyTwoWeekHigh", "fiftyTwoWeekLow",
+        # extra keys needed for quality gate
+        "profitMargins", "earningsGrowth", "revenueGrowth",
+        "currentRatio", "quickRatio", "freeCashflow",
     ]
     for attempt in range(2):
         try:
@@ -161,6 +164,84 @@ def fetch_fundamentals(ticker: str) -> dict:
             pass
         time.sleep(2)
     return {}
+
+
+def run_quality_gate(f: dict) -> list:
+    """Returns a list of (criterion, value, passed, explanation) tuples.
+    Each check is independent — no single check kills the whole score.
+    A stock passing 5+ out of 6 is considered quality-grade."""
+    checks = []
+
+    # 1. ROE >= 15% (good business earns more than cost of equity)
+    roe = f.get("returnOnEquity")
+    if roe is not None:
+        pct = round(roe * 100, 1)
+        checks.append((
+            "ROE (Return on Equity)", f"{pct}%",
+            roe >= 0.15,
+            "≥15% = good · <15% = weak" ,
+            "Measures how efficiently the company uses shareholders' money to generate profit.",
+        ))
+
+    # 2. Debt-to-Equity <= 1.5 (not over-leveraged; banks are exempt)
+    dte = f.get("debtToEquity")
+    if dte is not None:
+        # yfinance returns D/E as a ratio (e.g. 36 means 0.36 for most companies)
+        # normalize: if > 10, treat as percentage form
+        dte_ratio = dte / 100 if dte > 10 else dte
+        checks.append((
+            "Debt-to-Equity", f"{round(dte_ratio, 2)}x",
+            dte_ratio <= 1.5,
+            "≤1.5x = safe · >1.5x = high debt",
+            "High debt means more interest burden and risk during downturns.",
+        ))
+
+    # 3. P/E <= 40 (not wildly overvalued)
+    pe = f.get("trailingPE")
+    if pe is not None and pe > 0:
+        checks.append((
+            "P/E Ratio", f"{round(pe, 1)}x",
+            pe <= 40,
+            "≤40x = reasonable · >40x = expensive",
+            "How much you pay per ₹1 of earnings. Very high P/E means high expectations already priced in.",
+        ))
+
+    # 4. Profit Margin >= 8%
+    pm = f.get("profitMargins")
+    if pm is not None:
+        pct = round(pm * 100, 1)
+        checks.append((
+            "Profit Margin", f"{pct}%",
+            pm >= 0.08,
+            "≥8% = healthy · <8% = thin margins",
+            "What % of revenue actually becomes profit. Thin margins = vulnerable to cost increases.",
+        ))
+
+    # 5. Current Ratio >= 1.0 (can pay short-term bills)
+    cr = f.get("currentRatio")
+    if cr is not None:
+        checks.append((
+            "Current Ratio", f"{round(cr, 2)}x",
+            cr >= 1.0,
+            "≥1x = can cover short-term debt · <1x = liquidity risk",
+            "Whether the company has enough short-term assets to cover short-term liabilities.",
+        ))
+
+    # 6. Revenue or Earnings growth positive
+    eg = f.get("earningsGrowth")
+    rg = f.get("revenueGrowth")
+    growth = eg if eg is not None else rg
+    label  = "Earnings Growth" if eg is not None else "Revenue Growth"
+    if growth is not None:
+        pct = round(growth * 100, 1)
+        checks.append((
+            label, f"{pct}%",
+            growth > 0,
+            ">0% = growing · ≤0% = shrinking",
+            "A growing business compounds wealth. A shrinking one destroys it.",
+        ))
+
+    return checks
 
 
 @st.cache_data(ttl=3600)
@@ -770,6 +851,35 @@ with tab1:
                         st.warning(f"🟡 **HOLD** — signal score {score} / 6")
                     st.plotly_chart(make_gauge(score), use_container_width=True, config={"displayModeBar": False})
 
+                    # ── Quality gate ──────────────────────────────────────
+                    if fundamentals:
+                        qchecks = run_quality_gate(fundamentals)
+                        if qchecks:
+                            passed  = sum(1 for c in qchecks if c[2])
+                            total_q = len(qchecks)
+                            if passed >= 5:
+                                q_color, q_label = "✅", f"Quality grade: {passed}/{total_q} checks passed — strong business"
+                            elif passed >= 3:
+                                q_color, q_label = "⚠️", f"Quality grade: {passed}/{total_q} checks passed — average"
+                            else:
+                                q_color, q_label = "❌", f"Quality grade: {passed}/{total_q} checks passed — weak fundamentals"
+
+                            if passed >= 5:
+                                st.success(f"{q_color} {q_label}")
+                            elif passed >= 3:
+                                st.warning(f"{q_color} {q_label}")
+                            else:
+                                st.error(f"{q_color} {q_label}")
+
+                            # Combined signal + quality verdict
+                            if signal == "BUY" and passed >= 5:
+                                st.info("💡 **High-conviction setup:** Technical signal AND fundamentals both look strong. Best type of entry according to the hybrid strategy.")
+                            elif signal == "BUY" and passed < 3:
+                                st.warning("⚠️ **Caution:** Technical signal says BUY but fundamentals are weak. The hybrid strategy would skip this entry — momentum without quality often fails.")
+                            elif signal == "HOLD" and passed >= 5:
+                                st.info("💡 **Quality stock, waiting for signal:** Strong business but timing isn't confirmed yet. Worth watching for a BUY signal.")
+                    st.divider()
+
                     col1, col2 = st.columns(2)
                     with col1:
                         st.metric("Price", f"₹{indicators['price']}")
@@ -803,6 +913,30 @@ with tab1:
                         st.dataframe(format_fundamentals(fundamentals), hide_index=True, use_container_width=True)
                     else:
                         st.caption("Fundamentals temporarily unavailable (data provider rate limit). Price chart and technical score above are unaffected.")
+
+                with st.expander("🏆 Quality Gate — full checklist"):
+                    st.caption(
+                        "Based on your backtest findings: technical signals alone aren't enough. "
+                        "This checks whether the underlying business is actually strong before you trust a BUY signal."
+                    )
+                    if fundamentals:
+                        qchecks = run_quality_gate(fundamentals)
+                        if qchecks:
+                            for name, val, passed, range_hint, explanation in qchecks:
+                                icon = "✅" if passed else "❌"
+                                col_a, col_b = st.columns([3, 1])
+                                col_a.markdown(f"**{icon} {name}**: {val}")
+                                col_a.caption(f"{explanation}  \n*Range: {range_hint}*")
+                                col_b.markdown("")
+                            st.caption(
+                                "5–6 passed = quality stock ✅  ·  "
+                                "3–4 passed = average ⚠️  ·  "
+                                "0–2 passed = avoid ❌"
+                            )
+                        else:
+                            st.caption("Quality data not available for this stock from the free data source.")
+                    else:
+                        st.caption("Fundamentals unavailable — quality gate cannot run.")
 
                 with st.expander("📅 Daily vs Weekly vs Monthly view"):
                     st.caption(
@@ -1049,6 +1183,33 @@ with tab3:
                         "⚠️ **Remember:** No transaction costs, taxes, or slippage are modeled here. "
                         "Real returns would be lower. Past results never guarantee future performance."
                     )
+
+                    # Quality gate check on backtested stock
+                    with st.spinner("Checking fundamental quality..."):
+                        bt_fund = fetch_fundamentals(bt_symbol)
+                    if bt_fund:
+                        qchecks = run_quality_gate(bt_fund)
+                        passed_q = sum(1 for c in qchecks if c[2])
+                        total_q  = len(qchecks)
+                        if total_q > 0:
+                            if passed_q >= 5:
+                                verdict_lines.append(
+                                    f"🏆 **Quality gate: {passed_q}/{total_q} checks passed ✅** — "
+                                    "this is a fundamentally strong business. Technical signals on quality stocks "
+                                    "are more reliable than on weak ones — your backtest results here are more trustworthy."
+                                )
+                            elif passed_q >= 3:
+                                verdict_lines.append(
+                                    f"🏆 **Quality gate: {passed_q}/{total_q} checks passed ⚠️** — "
+                                    "average quality business. Some caution warranted even when the technical signal fires."
+                                )
+                            else:
+                                verdict_lines.append(
+                                    f"🏆 **Quality gate: {passed_q}/{total_q} checks passed ❌** — "
+                                    "weak fundamentals. The hybrid strategy would normally skip entries on this stock "
+                                    "regardless of the technical signal. That's consistent with the weak backtest results above."
+                                )
+
                     for line in verdict_lines:
                         st.markdown(f"- {line}")
 
